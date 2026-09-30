@@ -1,0 +1,37 @@
+{
+  "humanize": {
+    "enabled": true,
+    "quietHours": [],
+    "skipWhenCompletedToday": false,
+    "startJitterSec": [0, 0],
+    "searchTargetRatio": [0.85, 1.0],
+    "typingDelayMs": [40, 110],
+    "missProb": 0.05
+  },
+  "search": {
+    "desktopCount": 3,
+    "intervalSec": [2, 4],
+    "searchRefreshEvery": 10,
+    "randomScrollProb": 0.6,
+    "randomClickProb": 0.3,
+    "resultVisitSec": [3, 6],
+    "stagnantBatches": 2,
+    "pointsCheckEvery": 2
+  },
+  "tasks": {
+    "dailySet": true,
+    "earn": true,
+    "punchcard": true,
+    "redeem": true,
+    "maxTasks": 3
+  },
+  "mobile": {
+    "enabled": false,
+    "count": 3,
+    "profileDir": "edge_profile_mobile"
+  },
+  "runtime": {
+    "loginTimeoutMin": 6,
+    "exitWhenDone": true
+  }
+}

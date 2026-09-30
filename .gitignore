@@ -1,0 +1,37 @@
+# 浏览器持久化 Profile（包含登录态和 Cookie）
+chrome_profile/
+edge_profile/
+edge_profile_mobile/
+
+# 日志文件
+logs/
+*.log
+
+# DOM 扫描输出
+*_scan_result.txt
+
+# Python 缓存
+__pycache__/
+*.py[cod]
+*$py.class
+
+# 编辑器 / 系统
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+
+# IDE
+.idea/
+.vscode/
+*.sublime-project
+*.sublime-workspace
+
+# AI 辅助工具配置
+.codewhale/
+.claude/
+.deepseek/
+
+# 其他杂项
+nul

@@ -1,0 +1,2 @@
+patchright>=1.40
+playwright>=1.40
