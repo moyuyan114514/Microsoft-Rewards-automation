@@ -1,0 +1,8 @@
+{
+  "name": "微软Rewards签到",
+  "entry": "rewards_bot.py",
+  "params": [
+    { "name": "exit-when-done", "type": "bool", "default": true, "desc": "签到完成后自动退出（定时任务建议开）" },
+    { "name": "config", "type": "string", "default": "", "desc": "配置文件路径（留空用 config.json；测试可填 config.smoke.json）" }
+  ]
+}
