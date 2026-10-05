@@ -557,11 +557,37 @@ REDEEMABLE_AMOUNT_SELECTOR = "p.text-pageHeader"
 # "可领取"文本标签（用于定位卡片）
 REDEEMABLE_LABEL_SELECTOR = "p.text-labelControl:has-text('可领取')"
 
+# 2026-10 改版：点击"可领取"卡片会弹出"领取积分"确认弹窗（内含待领取明细），
+# 必须再点弹窗里的"领取积分"按钮才真正到账；旧版点击卡片即直接领取已失效
+CLAIM_DIALOG_SELECTOR = "[role='dialog'], [data-state='open']"
+CLAIM_CONFIRM_SELECTOR = "button:has-text('领取积分')"
+
+
+def _read_card_amount(page: Page) -> "int | None":
+    """按脚本同款定位链读"可领取"数量；卡片不存在返回 None"""
+    label = page.locator(REDEEMABLE_LABEL_SELECTOR).first
+    if not label.is_visible():
+        return None
+    card = label
+    for _ in range(6):
+        try:
+            card = card.locator("xpath=..")
+            cls = card.get_attribute("class") or ""
+            if "hover" in cls and ("card" in cls.lower() or "cursor-pointer" in cls):
+                break
+        except Exception:
+            break
+    amount_el = card.locator(REDEEMABLE_AMOUNT_SELECTOR).first
+    text = amount_el.inner_text().strip() if amount_el.is_visible() else "0"
+    digits = text.replace(",", "").strip()
+    return int(digits) if digits.isdigit() else 0
+
 
 def collect_redeemable_points(page: Page) -> bool:
     """
     在 Dashboard 的"可领取"卡片上领取积分。
-    新版 Dashboard 使用卡片式布局，直接点击卡片即可。
+    新版 Dashboard 使用卡片式布局，点击卡片后弹出"领取积分"确认弹窗，
+    需再点弹窗内的"领取积分"按钮；成功判定以卡片消失/数量归零为准。
 
     Args:
         page: Playwright Page 对象（需已登录且在 Dashboard 或附近页面）
@@ -580,12 +606,17 @@ def collect_redeemable_points(page: Page) -> bool:
 
     # 步骤 1: 找"可领取"卡片，读取可领取数量
     try:
-        label_el = page.locator(REDEEMABLE_LABEL_SELECTOR).first
-        if not label_el.is_visible():
+        amount = _read_card_amount(page)
+        if amount is None:
             log.warning("  未找到'可领取'卡片")
             return False
+        if amount == 0:
+            log.info("  无可领取积分 (0)，跳过")
+            return False
 
-        # 向上找卡片容器（含 hover 效果的父级 div）
+        # 步骤 2: 点击卡片（兼容千位分隔符，如 "1,250"）
+        log.info(f"  可领取积分: {amount}，点击卡片领取...")
+        label_el = page.locator(REDEEMABLE_LABEL_SELECTOR).first
         card = label_el
         for _ in range(6):
             try:
@@ -595,22 +626,35 @@ def collect_redeemable_points(page: Page) -> bool:
                     break
             except Exception:
                 break
-
-        # 在卡片内找数量（页面数字可能带千位分隔符，如 "1,250"）
-        amount_el = card.locator(REDEEMABLE_AMOUNT_SELECTOR).first
-        amount_text = amount_el.inner_text().strip() if amount_el.is_visible() else "0"
-        amount_digits = amount_text.replace(",", "").strip()
-        amount = int(amount_digits) if amount_digits.isdigit() else 0
-
-        if amount == 0:
-            log.info(f"  无可领取积分 ({amount_text})，跳过")
-            return False
-
-        log.info(f"  可领取积分: {amount_text}，点击卡片领取...")
         card.click()
+
+        # 步骤 3: 确认弹窗（未出现则视为旧版点击即领取）
+        try:
+            dlg = page.locator(CLAIM_DIALOG_SELECTOR).first
+            dlg.wait_for(state="visible", timeout=4000)
+            confirm = dlg.locator(CLAIM_CONFIRM_SELECTOR).first
+            if confirm.is_visible():
+                log.info("  检测到'领取积分'确认弹窗，点击确认按钮...")
+                confirm.click()
+            else:
+                log.warning("  弹窗已打开但未找到'领取积分'按钮")
+        except Exception:
+            log.info("  未出现确认弹窗（可能点击即领取）")
+
         time.sleep(3)
-        log.info("  ✓ 积分领取完成")
-        return True
+
+        # 步骤 4: 校验，卡片消失或数量归零才算成功；仍 >0 则刷新一次再核对
+        left = _read_card_amount(page)
+        if left is not None and left > 0:
+            time.sleep(2)
+            safe_goto(page, DASHBOARD_URL)
+            time.sleep(4)
+            left = _read_card_amount(page)
+        if left is None or left == 0:
+            log.info("  ✓ 积分领取完成")
+            return True
+        log.warning(f"  点击后仍剩 {left} 分未到账，视为失败")
+        return False
 
     except Exception as e:
         log.warning(f"  领取积分异常: {e}")

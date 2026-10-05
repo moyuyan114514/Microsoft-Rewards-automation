@@ -45,10 +45,12 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 BING_HOME = "https://cn.bing.com"
 DASHBOARD_URL = "https://rewards.bing.com/dashboard"
 EARN_URL = "https://rewards.bing.com/earn"
-POINTS_API = "https://rewards.bing.com/api/getuserinfo?type=1"  # 历史接口，读不到就走固定次数
 
 SEARCH_BOX = "#sb_form_q"
 RESULT_LINK = "#b_results .b_algo h2"
+
+# 积分展示元素：Dashboard 上多处复用（用户名/总积分/可领取），总积分是其中最大的纯数字
+BALANCE_SELECTOR = "p.text-pageHeader"
 
 PROFILE_DIR = SCRIPT_DIR / "edge_profile"
 LOG_DIR = SCRIPT_DIR / "logs"
@@ -269,15 +271,41 @@ def safe_goto(page, url: str, timeout: int = 30000, retries: int = 3) -> bool:
     return False
 
 
-def read_points(context) -> "int | None":
-    """读当前积分。接口失效返回 None，调用方需容忍（此时走固定次数）。"""
+def read_points(context, page=None) -> "int | None":
+    """读当前积分。读不到返回 None，调用方需容忍（此时走固定次数不提前收手）。
+
+    老接口 getuserinfo?type=1 已失效（2026-10-03 探测：纯请求被重定向到
+    OIDC 登录握手页，带 header 返回 401，页面内同源 fetch 接口不存在），
+    改从 Dashboard DOM 读取：p.text-pageHeader 有多处（用户名/总积分/可领取），
+    总积分是其中最大的纯数字（兼容 "10,040" 千位分隔符）。
+
+    page 已在 rewards 域时直接读当前页；否则开临时标签页加载 Dashboard，
+    不打断主页面正在进行的搜索。
+    """
+    tmp = None
     try:
-        resp = context.request.get(POINTS_API, timeout=15000)
-        text = resp.text()
-        m = re.search(r'"balance"\s*:\s*"?(\d+)', text) or re.search(r"<Balance>(\d+)</Balance>", text, re.I)
-        return int(m.group(1)) if m else None
+        if page is not None and "rewards.bing.com" in (page.url or ""):
+            target = page
+        else:
+            tmp = context.new_page()
+            tmp.goto(DASHBOARD_URL, wait_until="domcontentloaded", timeout=20000)
+            tmp.wait_for_selector(BALANCE_SELECTOR, timeout=15000)
+            target = tmp
+        texts = target.locator(BALANCE_SELECTOR).all_inner_texts()
+        nums = []
+        for t in texts:
+            digits = t.replace(",", "").strip()
+            if digits.isdigit():
+                nums.append(int(digits))
+        return max(nums) if nums else None
     except Exception:
         return None
+    finally:
+        if tmp is not None:
+            try:
+                tmp.close()
+            except Exception:
+                pass
 
 
 # ── 登录检测 ──────────────────────────────────────────────
@@ -414,7 +442,7 @@ def run_search_session(context, page, human: Human, query_iter, count: int,
         if target < count:
             log.info(f"  拟人化：本次目标随机打折 {count}→{target} (ratio={ratio:.2f})")
 
-    prev_points = read_points(context)
+    prev_points = read_points(context, page)
     log.info(f"[{tag}] 开始搜索，目标 {target} 次" + (f"，当前积分 {prev_points}" if prev_points is not None else "（积分读取不可用）"))
 
     done, stagnant = 0, 0
@@ -436,7 +464,7 @@ def run_search_session(context, page, human: Human, query_iter, count: int,
             continue
 
         if i % cfg_search["pointsCheckEvery"] == 0:
-            cur = read_points(context)
+            cur = read_points(context, page)
             if cur is not None and prev_points is not None:
                 gained = cur - prev_points
                 if gained > 0:
@@ -456,38 +484,66 @@ def run_search_session(context, page, human: Human, query_iter, count: int,
 
 
 # ── Daily Set / Earn / Punchcard / 领积分 ─────────────────
-def _popup_dwell_close(popup):
-    """进入弹出的任务标签页，停留一段随机时间再关闭"""
-    popup.wait_for_load_state("domcontentloaded")
-    time.sleep(random.randint(5, 9))
-    popup.close()
+def _abs_url(href: str, base: str = "https://rewards.bing.com") -> str:
+    """任务卡片里的 href 可能是绝对/相对/协议相对三种形态，统一成可访问 URL"""
+    if href.startswith("http"):
+        return href
+    if href.startswith("//"):
+        return "https:" + href
+    if href.startswith("/"):
+        # rewards 页里的 /search?q= 链接属于 Bing 域，其余（/earn/...）留在本域
+        return f"https://www.bing.com{href}" if href.startswith("/search") else base + href
+    return href
 
 
-def _click_task_open(page, human: Human, locator, visit=(5, 9)) -> str:
-    """点击任务卡片，兼容三种打开方式：
-    'popup'    新标签页（主流）
-    'same-tab' 当前页跳转（改版兼容）
-    'none'     点击未产生导航（任务可能已完成）
+def _snapshot_hrefs(page, selector: str, timeout: int = 3000) -> list:
+    """把定位器命中的链接固化成 href 字符串列表。
+
+    Rewards 页面在任务完成后会局部重渲染，.all() 返回的定位器到后面再解析
+    会等满 30s 超时并打断整个任务循环（2026-10-01 punchcard 事故）。
+    所以一律先取 href 快照、再按 URL 逐条访问；单条失效只丢自己，
+    timeout 调短保证不会长时间挂住。
     """
-    before = set(page.context.pages)
-    url_before = page.url
+    hrefs, seen = [], set()
     try:
-        with page.expect_popup(timeout=10000) as popup_info:
-            human.click_verified(locator)
-        _popup_dwell_close(popup_info.value)
-        return "popup"
+        for el in page.locator(selector).all():
+            try:
+                if not el.is_visible():
+                    continue
+                href = (el.get_attribute("href", timeout=timeout) or "").strip()
+                if href and href not in seen:
+                    seen.add(href)
+                    hrefs.append(href)
+            except Exception:
+                continue
     except Exception:
         pass
+    return hrefs
 
-    if page.url != url_before:
-        human.pause(*visit)
-        try:
-            page.go_back(timeout=10000)
-        except Exception:
-            pass
-        human.pause(1, 2)
-        return "same-tab"
-    return "none"
+
+def _visit_dwell_close(context, url: str, dwell=(5, 9)) -> bool:
+    """新开标签页访问 url，停留随机时长后关闭。
+
+    任务卡片/CTA 都是 target=_blank 链接，点击弹出的就是 href 本身，
+    直接访问与点击等价，但不吃页面重渲染和点击落点的亏；
+    停留时长保留随机性（拟人）。
+    """
+    tp = None
+    try:
+        tp = context.new_page()
+        tp.goto(url, timeout=30000, wait_until="domcontentloaded")
+        time.sleep(random.randint(dwell[0], dwell[1]))
+        return True
+    except Exception as e:
+        log.debug(f"  访问任务页失败: {e}")
+        return False
+    finally:
+        if tp is not None:
+            try:
+                tp.close()
+            except Exception:
+                pass
+            time.sleep(random.uniform(0.8, 1.5))
 
 
 def complete_daily_set(page, human: Human) -> int:
@@ -501,31 +557,18 @@ def complete_daily_set(page, human: Human) -> int:
         time.sleep(5)
     time.sleep(2)
 
-    tasks, seen = [], set()
-    for task in page.locator("#dailyset a[href*='search?q=']").all():
-        try:
-            if task.is_visible():
-                href = task.get_attribute("href") or ""
-                if href and href not in seen:
-                    seen.add(href)
-                    tasks.append(task)
-        except Exception:
-            continue
-
-    log.info(f"  检测到 {len(tasks)} 个 Daily Set 任务")
+    hrefs = _snapshot_hrefs(page, "#dailyset a[href*='search?q=']")
+    log.info(f"  检测到 {len(hrefs)} 个 Daily Set 任务")
     done = 0
-    for index, task in enumerate(tasks, 1):
-        try:
-            human.pause(1.5, 3.0)
-            result = _click_task_open(page, human, task)
-            if result == "none":
-                log.info(f"  任务 {index} 未产生导航（可能今日已完成）")
-            else:
-                log.info(f"  任务 {index} ✓ [{result}]")
+    for index, href in enumerate(hrefs, 1):
+        human.pause(1.5, 3.0)
+        url = _abs_url(href)
+        if _visit_dwell_close(page.context, url):
+            log.info(f"  任务 {index} ✓")
             done += 1
-        except Exception as e:
-            log.error(f"  任务 {index} 失败: {e}")
-    log.info(f"Daily Set 完成: {done}/{len(tasks)}")
+        else:
+            log.error(f"  任务 {index} 失败: {url[:70]}")
+    log.info(f"Daily Set 完成: {done}/{len(hrefs)}")
     return done
 
 
@@ -539,7 +582,8 @@ EARN_CTA_SELECTOR = "a[aria-label][href*='search?q=']:not([aria-disabled='true']
 
 
 def complete_earn_tasks(page, human: Human, max_tasks: int = 10) -> int:
-    """Earn 页面：简单任务直接点；punchcard 进 quest 子页面逐个点 CTA"""
+    """Earn 页面：简单任务直接访问；punchcard 进 quest 子页面逐条访问 CTA。
+    全程 href 快照驱动，只有真正访问成功才计数——杜绝"没点上也算完成"。"""
     log.info("正在处理 Earn 页面加分项...")
     if not safe_goto(page, EARN_URL):
         return 0
@@ -550,70 +594,61 @@ def complete_earn_tasks(page, human: Human, max_tasks: int = 10) -> int:
         time.sleep(5)
     time.sleep(3)
 
-    def _collect_simple():
-        tasks, seen = [], set()
-        for selector in EARN_SIMPLE_TASK_SELECTORS:
-            try:
-                for el in page.locator(selector).all():
-                    try:
-                        if not el.is_visible():
-                            continue
-                        href = (el.get_attribute("href") or "").strip()
-                        if href and href not in seen:
-                            seen.add(href)
-                            tasks.append(el)
-                    except Exception:
-                        continue
-            except Exception:
-                continue
-        return tasks
-
     done = 0
-    for el in _collect_simple():
-        if done >= max_tasks:
-            break
-        try:
-            text = el.inner_text().strip().replace("\n", " ")[:40]
-            log.info(f"  点击任务: {text}")
-            _click_task_open(page, human, el)
-            done += 1
-            human.pause(1.5, 3.0)
-        except Exception as e:
-            log.error(f"  任务失败: {e}")
 
-    # punchcard
-    if done < max_tasks:
-        seen_pc = set()
-        for pc in page.locator(EARN_PUNCHCARD_SELECTOR).all():
+    def _do_simple(hrefs: list, seen: set) -> None:
+        nonlocal done
+        for href in hrefs:
             if done >= max_tasks:
                 break
-            try:
-                href = pc.get_attribute("href") or ""
-                if not pc.is_visible() or not href or href in seen_pc:
-                    continue
-                seen_pc.add(href)
-                log.info(f"  进入 punchcard: {pc.inner_text().strip()[:50]}")
-                full_url = f"https://rewards.bing.com{href}" if href.startswith("/") else href
-                pc_page = page.context.new_page()
-                pc_page.goto(full_url, timeout=30000)
-                pc_page.wait_for_load_state("domcontentloaded")
-                time.sleep(4)
+            if href in seen:
+                continue
+            seen.add(href)
+            url = _abs_url(href)
+            label = url.split("q=")[-1][:40] if "q=" in url else url[:40]
+            log.info(f"  点击任务: {label}")
+            if _visit_dwell_close(page.context, url):
+                done += 1
+                human.pause(1.5, 3.0)
+            else:
+                log.error(f"  任务失败: {label}")
 
-                for cta in pc_page.locator(EARN_CTA_SELECTOR).all():
+    # ── 阶段 A：简单任务 ──
+    simple_hrefs, seen_hrefs = [], set()
+    for selector in EARN_SIMPLE_TASK_SELECTORS:
+        for href in _snapshot_hrefs(page, selector):
+            if href not in seen_hrefs:
+                seen_hrefs.add(href)
+                simple_hrefs.append(href)
+    log.info(f"  检测到 {len(simple_hrefs)} 个简单任务")
+    _do_simple(simple_hrefs, seen_hrefs)
+
+    # ── 阶段 B：punchcard（quest）──
+    if done < max_tasks:
+        for href in _snapshot_hrefs(page, EARN_PUNCHCARD_SELECTOR):
+            if done >= max_tasks:
+                break
+            log.info(f"  进入 punchcard: {_abs_url(href)[:60]}")
+            pc_page = None
+            try:
+                pc_page = page.context.new_page()
+                pc_page.goto(_abs_url(href), timeout=30000, wait_until="domcontentloaded")
+                time.sleep(4)
+                for cta in _snapshot_hrefs(pc_page, EARN_CTA_SELECTOR):
                     if done >= max_tasks:
                         break
-                    try:
-                        with pc_page.expect_popup(timeout=10000) as popup_info:
-                            human.click_verified(cta)
-                        _popup_dwell_close(popup_info.value)
+                    if _visit_dwell_close(page.context, _abs_url(cta)):
                         done += 1
                         human.pause(1.0, 2.0)
-                    except Exception:
-                        continue
-                pc_page.close()
-                time.sleep(1)
             except Exception as e:
                 log.error(f"  punchcard 处理异常: {e}")
+            finally:
+                if pc_page is not None:
+                    try:
+                        pc_page.close()
+                    except Exception:
+                        pass
+                time.sleep(1)
 
     log.info(f"Earn 任务完成: {done} 个")
     return done
@@ -621,20 +656,52 @@ def complete_earn_tasks(page, human: Human, max_tasks: int = 10) -> int:
 
 REDEEMABLE_LABEL_SELECTOR = "p.text-labelControl:has-text('可领取')"
 REDEEMABLE_AMOUNT_SELECTOR = "p.text-pageHeader"
+# 2026-10 改版：点击"可领取"卡片会弹出"领取积分"确认弹窗（内含待领取明细），
+# 必须再点弹窗里的"领取积分"按钮才真正到账；旧版点击卡片即直接领取已失效
+CLAIM_DIALOG_SELECTOR = "[role='dialog'], [data-state='open']"
+CLAIM_CONFIRM_SELECTOR = "button:has-text('领取积分')"
+
+
+def _read_card_amount(page) -> "int | None":
+    """按脚本同款定位链读"可领取"数量；卡片不存在返回 None"""
+    label = page.locator(REDEEMABLE_LABEL_SELECTOR).first
+    if not label.is_visible():
+        return None
+    card = label
+    for _ in range(6):
+        try:
+            card = card.locator("xpath=..")
+            cls = card.get_attribute("class") or ""
+            if "hover" in cls and ("card" in cls.lower() or "cursor-pointer" in cls):
+                break
+        except Exception:
+            break
+    amount_el = card.locator(REDEEMABLE_AMOUNT_SELECTOR).first
+    text = amount_el.inner_text().strip() if amount_el.is_visible() else "0"
+    digits = text.replace(",", "").strip()
+    return int(digits) if digits.isdigit() else 0
 
 
 def collect_redeemable_points(page, human: Human) -> bool:
-    """领取 Dashboard"可领取"卡片积分（已修复千位分隔符识别问题）"""
+    """领取 Dashboard"可领取"卡片积分（已修复千位分隔符识别问题、确认弹窗流程）。
+
+    成功判定以领取后卡片消失/数量归零为准，不再默认点击即成功。
+    """
     log.info("正在尝试领取积分...")
     if not safe_goto(page, DASHBOARD_URL):
         return False
     time.sleep(4)
     try:
-        label = page.locator(REDEEMABLE_LABEL_SELECTOR).first
-        if not label.is_visible():
+        amount = _read_card_amount(page)
+        if amount is None:
             log.info("  未找到'可领取'卡片，跳过")
             return False
+        if amount == 0:
+            log.info("  无可领取积分 (0)，跳过")
+            return False
 
+        log.info(f"  可领取 {amount} 分，点击卡片...")
+        label = page.locator(REDEEMABLE_LABEL_SELECTOR).first
         card = label
         for _ in range(6):
             try:
@@ -644,21 +711,35 @@ def collect_redeemable_points(page, human: Human) -> bool:
                     break
             except Exception:
                 break
-
-        amount_el = card.locator(REDEEMABLE_AMOUNT_SELECTOR).first
-        amount_text = amount_el.inner_text().strip() if amount_el.is_visible() else "0"
-        digits = amount_text.replace(",", "").strip()  # 兼容 "1,250" 这类千位分隔符
-        amount = int(digits) if digits.isdigit() else 0
-
-        if amount == 0:
-            log.info(f"  无可领取积分 ({amount_text})，跳过")
-            return False
-
-        log.info(f"  可领取 {amount_text} 分，点击卡片...")
         human.click(card)
+
+        # 等确认弹窗；未出现（点击即领取的旧版行为）则继续走校验
+        try:
+            dlg = page.locator(CLAIM_DIALOG_SELECTOR).first
+            dlg.wait_for(state="visible", timeout=4000)
+            confirm = dlg.locator(CLAIM_CONFIRM_SELECTOR).first
+            if confirm.is_visible():
+                log.info("  检测到'领取积分'确认弹窗，点击确认按钮...")
+                human.click(confirm)
+            else:
+                log.warning("  弹窗已打开但未找到'领取积分'按钮")
+        except Exception:
+            log.info("  未出现确认弹窗（可能点击即领取）")
+
         time.sleep(3)
-        log.info("  ✓ 积分领取完成")
-        return True
+
+        # 校验：卡片消失或数量归零才算成功；仍 >0 则刷新一次再核对
+        left = _read_card_amount(page)
+        if left is not None and left > 0:
+            time.sleep(2)
+            safe_goto(page, DASHBOARD_URL)
+            time.sleep(4)
+            left = _read_card_amount(page)
+        if left is None or left == 0:
+            log.info("  ✓ 积分领取完成")
+            return True
+        log.warning(f"  点击后仍剩 {left} 分未到账，视为失败")
+        return False
     except Exception as e:
         log.warning(f"  领取积分异常: {e}")
         return False
@@ -802,7 +883,7 @@ def main():
         redeemed = collect_redeemable_points(page, human) if tasks_cfg["redeem"] else False
 
         # ── 汇总 ──
-        final_points = read_points(context)
+        final_points = read_points(context, page)
         log.info("=" * 60)
         log.info("签到完成! 汇总:")
         log.info(f"  PC 搜索: {desktop_done} 次 | 移动搜索: {mobile_done} 次")
