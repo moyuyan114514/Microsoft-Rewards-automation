@@ -628,16 +628,12 @@ def collect_redeemable_points(page: Page) -> bool:
                 break
         card.click()
 
-        # 步骤 3: 确认弹窗（未出现则视为旧版点击即领取）
+        # 步骤 3: 确认弹窗；弹窗容器先出现、按钮后渲染，用 wait_for 等按钮可见
         try:
-            dlg = page.locator(CLAIM_DIALOG_SELECTOR).first
-            dlg.wait_for(state="visible", timeout=4000)
-            confirm = dlg.locator(CLAIM_CONFIRM_SELECTOR).first
-            if confirm.is_visible():
-                log.info("  检测到'领取积分'确认弹窗，点击确认按钮...")
-                confirm.click()
-            else:
-                log.warning("  弹窗已打开但未找到'领取积分'按钮")
+            confirm = page.locator(CLAIM_CONFIRM_SELECTOR).first
+            confirm.wait_for(state="visible", timeout=6000)
+            log.info("  检测到'领取积分'确认弹窗，点击确认按钮...")
+            confirm.click()
         except Exception:
             log.info("  未出现确认弹窗（可能点击即领取）")
 
